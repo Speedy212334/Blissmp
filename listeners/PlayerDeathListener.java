@@ -1,0 +1,360 @@
+package dev.xoperr.blissgems.listeners;
+
+import dev.xoperr.blissgems.BlissGems;
+import dev.xoperr.blissgems.utils.CustomItemManager;
+import dev.xoperr.blissgems.utils.EnergyState;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.SkullMeta;
+
+public class PlayerDeathListener implements Listener {
+   private final BlissGems plugin;
+   private final Map<UUID, List<ItemStack>> savedGems = new HashMap<>();
+
+   public PlayerDeathListener(BlissGems plugin) {
+      this.plugin = plugin;
+   }
+
+   @EventHandler(priority = EventPriority.HIGHEST)
+   public void onPlayerDeath(PlayerDeathEvent event) {
+      Player victim = event.getEntity();
+      Player killer = victim.getKiller();
+      EnergyState victimState = this.plugin.getEnergyManager().getEnergyState(victim);
+      boolean victimHadEnergy = victimState != EnergyState.BROKEN;
+      int energyLoss = this.plugin.getConfigManager().getEnergyLossOnDeath();
+      this.plugin.getEnergyManager().removeEnergy(victim, energyLoss);
+      int currentEnergy = this.plugin.getEnergyManager().getEnergy(victim);
+      if (currentEnergy <= 0 && this.plugin.getConfigManager().isBanOnZeroEnergyEnabled()) {
+         String banMessage = this.plugin.getConfigManager().getFormattedMessage("energy-zero-banned");
+         if (banMessage == null || banMessage.isEmpty()) {
+            banMessage = "You have been banned for reaching 0 energy!";
+         }
+
+         victim.ban(banMessage, (Date)null, (String)null);
+      }
+
+      if (killer != null && victimHadEnergy) {
+         int energyGain = this.plugin.getConfigManager().getEnergyGainOnKill();
+         this.plugin.getEnergyManager().addEnergy(killer, energyGain);
+         EnergyState killerState = this.plugin.getEnergyManager().getEnergyState(killer);
+         if (killerState.isMaxEnergy() && this.plugin.getConfigManager().isEnergyBottleDropEnabled()) {
+            this.dropEnergyBottle(victim.getLocation());
+         }
+      }
+
+      if (killer != null && this.plugin.getConfig().getBoolean("pvp.drop-head-on-kill", true)) {
+         this.dropPlayerHead(victim);
+      }
+
+      if (this.plugin.getConfigManager().isUpgraderDropOnTier2DeathEnabled()
+         && this.plugin.getGemManager().hasActiveGem(victim)
+         && this.plugin.getGemManager().getGemTier(victim) == 2) {
+         this.dropUpgrader(victim.getLocation());
+      }
+
+      this.plugin.getAstraAbilities().cleanup(victim);
+      this.plugin.getFireAbilities().cleanup(victim);
+      this.plugin.getFluxAbilities().cleanup(victim);
+      this.plugin.getLifeAbilities().cleanup(victim);
+      if (this.plugin.getSoulManager() != null) {
+         this.plugin.getSoulManager().cleanup(victim);
+      }
+
+      if (this.plugin.getGoldGemManager() != null) {
+         this.plugin.getGoldAbilities().cleanup(victim);
+         this.plugin.getGoldGemManager().resetProgress(victim);
+      }
+
+      String deathGemId = this.plugin.getGemManager().getGemId(victim);
+      if (deathGemId != null && this.plugin.getGemManager().getGemTier(victim) == 2 && this.plugin.getGemManager().downgradeGem(victim, deathGemId)) {
+         victim.sendMessage("§c§lYour gem reverted to Tier 1!");
+      }
+
+      this.plugin.getGemManager().updateActiveGem(victim);
+      if (killer != null) {
+         this.plugin.getGemManager().updateActiveGem(killer);
+      }
+   }
+
+   private void dropPlayerHead(Player victim) {
+      ItemStack head = new ItemStack(Material.PLAYER_HEAD);
+      SkullMeta meta = (SkullMeta)head.getItemMeta();
+      if (meta != null) {
+         meta.setPlayerProfile(victim.getPlayerProfile());
+         meta.setDisplayName("§e" + victim.getName() + "'s Head");
+         head.setItemMeta(meta);
+      }
+
+      victim.getWorld().dropItemNaturally(victim.getLocation(), head);
+   }
+
+   @EventHandler(priority = EventPriority.LOWEST)
+   public void onPlayerDeathProtectGems(PlayerDeathEvent event) {
+      if (this.plugin.getGoldGemManager() != null) {
+         this.plugin.getGoldGemManager().harvestOnDeath(event);
+      }
+
+      Player victim = event.getEntity();
+      event.getDrops().replaceAll(item -> this.toTier1(item, victim));
+      if (this.plugin.getConfig().getBoolean("gems.prevent-drop", true)) {
+         ArrayList<ItemStack> gemsToSave = new ArrayList<>();
+         List droppableOnDeath = this.plugin.getConfig().contains("gems.droppable-on-death")
+            ? this.plugin.getConfig().getStringList("gems.droppable-on-death")
+            : List.of();
+         event.getDrops().removeIf(item -> {
+            if (CustomItemManager.isUndroppable(item)) {
+               if (this.isDroppableOnDeath(item, droppableOnDeath)) {
+                  return false;
+               }
+
+               gemsToSave.add(item.clone());
+               return true;
+            } else {
+               return false;
+            }
+         });
+         if (!gemsToSave.isEmpty()) {
+            this.savedGems.put(victim.getUniqueId(), gemsToSave);
+            this.saveGemsToDisk(victim.getUniqueId(), gemsToSave);
+         }
+      }
+   }
+
+   private ItemStack toTier1(ItemStack gem, Player owner) {
+      String id = CustomItemManager.getIdByItem(gem);
+      if (id != null && id.endsWith("_gem_t2") && !CustomItemManager.isGoldSkinned(gem)) {
+         ItemStack t1 = CustomItemManager.getItemById(id.substring(0, id.length() - 2) + "1", this.plugin.getEnergyManager().getEnergy(owner));
+         return t1 != null ? t1 : gem;
+      } else {
+         return gem;
+      }
+   }
+
+   private boolean isDroppableOnDeath(ItemStack item, List<String> droppableGems) {
+      if (droppableGems.isEmpty()) {
+         return false;
+      }
+
+      String id = CustomItemManager.getIdByItem(item);
+      if (id == null) {
+         return false;
+      }
+
+      int gemMarker = id.indexOf("_gem_t");
+      if (gemMarker <= 0) {
+         return false;
+      }
+
+      String gemId = id.substring(0, gemMarker);
+
+      for (String entry : droppableGems) {
+         String trimmed;
+         if (entry != null && ((trimmed = entry.trim()).equalsIgnoreCase(gemId) || trimmed.equalsIgnoreCase(id))) {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   public void validateDroppableOnDeathConfig() {
+      for (String entry : this.plugin.getConfig().getStringList("gems.droppable-on-death")) {
+         if (entry != null && !entry.trim().isEmpty()) {
+            String gemId = entry.trim().toLowerCase();
+            int gemMarker = gemId.indexOf("_gem_t");
+            if (gemMarker > 0) {
+               gemId = gemId.substring(0, gemMarker);
+            }
+
+            if (this.plugin.getGemRegistry() == null || this.plugin.getGemRegistry().getGem(gemId) == null) {
+               this.plugin
+                  .getLogger()
+                  .warning(
+                     "gems.droppable-on-death lists '"
+                        + entry
+                        + "', which is not a known gem - it will never drop. Use the plain gem id (e.g. auratus, heretic)."
+                  );
+            }
+         }
+      }
+   }
+
+   @EventHandler
+   public void onPlayerRespawn(PlayerRespawnEvent event) {
+      Player player = event.getPlayer();
+      UUID playerId = player.getUniqueId();
+      List<ItemStack> gems = null;
+      if (this.savedGems.containsKey(playerId)) {
+         gems = this.savedGems.remove(playerId);
+         this.clearGemsFromDisk(playerId);
+      } else {
+         gems = this.loadGemsFromDisk(playerId);
+      }
+
+      if (gems != null && !gems.isEmpty()) {
+         boolean singleGemOnly = this.plugin.getConfig().getBoolean("gems.single-gem-only", true);
+         List<ItemStack> toRestore = singleGemOnly && gems.size() > 1 ? List.of(gems.get(0)) : gems;
+         if (singleGemOnly && gems.size() > 1) {
+            this.plugin
+               .getLogger()
+               .warning("Player " + player.getName() + " had " + gems.size() + " gems saved! Only returning first gem due to single-gem-only config.");
+         }
+
+         for (ItemStack gem : toRestore) {
+            if (!this.playerAlreadyHasGem(player, gem)) {
+               player.getInventory().addItem(new ItemStack[]{gem});
+            }
+         }
+      }
+
+      this.plugin.getServer().getScheduler().runTaskLater(this.plugin, () -> {
+         if (player.isOnline()) {
+            this.enforceOneGemOnly(player);
+            this.plugin.getGemManager().updateActiveGem(player);
+         }
+      }, 1L);
+   }
+
+   private void dropEnergyBottle(Location location) {
+      ItemStack bottle = CustomItemManager.getItemById("energy_bottle");
+      if (bottle != null) {
+         location.getWorld().dropItemNaturally(location, bottle);
+      }
+   }
+
+   private void dropUpgrader(Location location) {
+      ItemStack upgrader = CustomItemManager.getItemById("gem_upgrader");
+      if (upgrader != null) {
+         location.getWorld().dropItemNaturally(location, upgrader);
+      }
+   }
+
+   private void saveGemsToDisk(UUID playerId, List<ItemStack> gems) {
+      File dataFolder = new File(this.plugin.getDataFolder(), "playerdata");
+      if (!dataFolder.exists()) {
+         dataFolder.mkdirs();
+      }
+
+      File file;
+      YamlConfiguration data = (file = new File(dataFolder, playerId + ".yml")).exists() ? YamlConfiguration.loadConfiguration(file) : new YamlConfiguration();
+      data.set("saved-gems", gems);
+
+      try {
+         data.save(file);
+      } catch (IOException e) {
+         this.plugin.getLogger().severe("Failed to save gems for player " + playerId + ": " + e.getMessage());
+      }
+   }
+
+   private List<ItemStack> loadGemsFromDisk(UUID playerId) {
+      File dataFolder = new File(this.plugin.getDataFolder(), "playerdata");
+      File file = new File(dataFolder, playerId + ".yml");
+      if (!file.exists()) {
+         return null;
+      }
+
+      YamlConfiguration data = YamlConfiguration.loadConfiguration(file);
+      List gems = (List)data.get("saved-gems");
+      if (gems != null) {
+         data.set("saved-gems", null);
+
+         try {
+            data.save(file);
+         } catch (IOException e) {
+            this.plugin.getLogger().warning("Failed to clear saved gems from disk for " + playerId);
+         }
+      }
+
+      return gems;
+   }
+
+   private void clearGemsFromDisk(UUID playerId) {
+      File dataFolder = new File(this.plugin.getDataFolder(), "playerdata");
+      File file = new File(dataFolder, playerId + ".yml");
+      if (file.exists()) {
+         YamlConfiguration data = YamlConfiguration.loadConfiguration(file);
+         if (data.contains("saved-gems")) {
+            data.set("saved-gems", null);
+
+            try {
+               data.save(file);
+            } catch (IOException e) {
+               this.plugin.getLogger().warning("Failed to clear saved gems from disk for " + playerId);
+            }
+         }
+      }
+   }
+
+   private boolean playerAlreadyHasGem(Player player, ItemStack gem) {
+      String gemId = CustomItemManager.getIdByItem(gem);
+      if (gemId == null) {
+         return false;
+      }
+
+      for (ItemStack item : player.getInventory().getContents()) {
+         if (item != null && gemId.equals(CustomItemManager.getIdByItem(item))) {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   private void enforceOneGemOnly(Player player) {
+      if (this.plugin.getConfigManager().isSingleGemOnly()) {
+         boolean foundFirst = false;
+
+         for (int i = 0; i < player.getInventory().getSize(); i++) {
+            ItemStack item = player.getInventory().getItem(i);
+            String itemId;
+            if (item != null && (itemId = CustomItemManager.getIdByItem(item)) != null && this.plugin.getGemManager().isAnyGem(itemId)) {
+               if (!foundFirst) {
+                  foundFirst = true;
+               } else {
+                  player.getInventory().setItem(i, null);
+                  this.plugin.getLogger().info("Removed duplicate gem from " + player.getName() + " on respawn.");
+               }
+            }
+         }
+      }
+   }
+
+   @EventHandler
+   public void onPlayerJoin(PlayerJoinEvent event) {
+      this.plugin.getGemManager().updateActiveGem(event.getPlayer());
+   }
+
+   @EventHandler
+   public void onPlayerQuit(PlayerQuitEvent event) {
+      Player player = event.getPlayer();
+      this.plugin.getAstraAbilities().cleanup(player);
+      this.plugin.getFireAbilities().cleanup(player);
+      this.plugin.getFluxAbilities().cleanup(player);
+      this.plugin.getSpeedAbilities().cleanup(player.getUniqueId());
+      this.plugin.getWealthAbilities().cleanup(player);
+      this.plugin.getLifeAbilities().cleanup(player);
+      this.plugin.getSoulManager().cleanup(player);
+      this.plugin.getSoulManager().clearSouls(player.getUniqueId());
+      this.plugin.getEnergyManager().clearCache(player.getUniqueId());
+      this.plugin.getGemManager().clearCache(player.getUniqueId());
+      this.plugin.getAbilityManager().clearCache(player.getUniqueId());
+   }
+}

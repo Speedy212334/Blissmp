@@ -1,0 +1,690 @@
+package dev.xoperr.blissgems.managers;
+
+import dev.xoperr.blissgems.BlissGems;
+import dev.xoperr.blissgems.api.GemAbilityHandler;
+import dev.xoperr.blissgems.api.GemDefinition;
+import dev.xoperr.blissgems.utils.CustomItemManager;
+import dev.xoperr.blissgems.utils.GemType;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+
+public class GemManager {
+   private final BlissGems plugin;
+   private final Map<UUID, GemManager.ActiveGem> activeGems;
+   private final Map<UUID, Integer> channelTierOverride = new ConcurrentHashMap<>();
+
+   public GemManager(BlissGems plugin) {
+      this.plugin = plugin;
+      this.activeGems = new HashMap<>();
+   }
+
+   public void updateActiveGem(Player player) {
+      GemManager.ActiveGem currentGem = this.activeGems.get(player.getUniqueId());
+      ItemStack[] contents = player.getInventory().getContents();
+      GemManager.ActiveGem foundGem = null;
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+
+      for (ItemStack item : contents) {
+         String itemId;
+         if (item != null && (itemId = CustomItemManager.getIdByItem(item)) != null) {
+            if (GemType.isGem(itemId)) {
+               GemType type = GemType.fromOraxenId(itemId);
+               int tier = GemType.getTierFromOraxenId(itemId);
+               if (type != null && this.plugin.getConfigManager().isGemEnabled(type)) {
+                  foundGem = new GemManager.ActiveGem(type, tier);
+                  break;
+               }
+            }
+
+            if (registry != null && registry.isRegisteredGem(itemId)) {
+               String gemId = registry.gemIdFromItemId(itemId);
+               int tier = registry.tierFromItemId(itemId);
+               foundGem = new GemManager.ActiveGem(gemId, tier);
+               break;
+            }
+         }
+      }
+
+      GemAbilityHandler handler;
+      if (currentGem != null
+         && (foundGem == null || !Objects.equals(currentGem.getGemId(), foundGem.getGemId()))
+         && currentGem.getGemId() != null
+         && registry != null
+         && (handler = registry.getAbilityHandler(currentGem.getGemId())) != null) {
+         handler.cleanup(player);
+      }
+
+      if (foundGem != null) {
+         this.activeGems.put(player.getUniqueId(), foundGem);
+      } else {
+         this.activeGems.remove(player.getUniqueId());
+      }
+
+      if (foundGem != null) {
+         this.updateGemTextures(player);
+      }
+   }
+
+   public GemManager.ActiveGem getActiveGem(Player player) {
+      return this.activeGems.get(player.getUniqueId());
+   }
+
+   public boolean hasActiveGem(Player player) {
+      return this.activeGems.containsKey(player.getUniqueId());
+   }
+
+   public GemType getGemType(Player player) {
+      GemManager.ActiveGem gem = this.getActiveGem(player);
+      return gem != null ? gem.getType() : null;
+   }
+
+   public void setChannelTierOverride(UUID id, int tier) {
+      this.channelTierOverride.put(id, tier);
+   }
+
+   public void clearChannelTierOverride(UUID id) {
+      this.channelTierOverride.remove(id);
+   }
+
+   public int getGemTier(Player player) {
+      Integer override = this.channelTierOverride.get(player.getUniqueId());
+      if (override != null) {
+         return override;
+      }
+
+      GoldGemManager gold = this.plugin.getGoldGemManager();
+      if (gold != null && gold.holdsGoldGem(player)) {
+         int goldTier = gold.getActiveTier(player.getUniqueId());
+         if (goldTier > 1) {
+            return goldTier;
+         }
+      }
+
+      GemManager.ActiveGem gem = this.getActiveGem(player);
+      return gem != null ? gem.getTier() : 1;
+   }
+
+   public int getGemTier(Player player, GemType type) {
+      Integer override = this.channelTierOverride.get(player.getUniqueId());
+      return override != null ? override : this.getTierFor(player, type);
+   }
+
+   public String getGemId(Player player) {
+      GemManager.ActiveGem gem = this.getActiveGem(player);
+      return gem != null ? gem.getGemId() : null;
+   }
+
+   public boolean hasGemType(Player player, GemType type) {
+      GemManager.ActiveGem gem = this.getActiveGem(player);
+      return gem != null && gem.getType() == type ? true : this.hasGemTypeInOffhand(player, type);
+   }
+
+   private String getHeldGemItemId(Player player) {
+      ItemStack offhand = player.getInventory().getItemInOffHand();
+      String itemId = offhand != null ? CustomItemManager.getIdByItem(offhand) : null;
+      if (itemId != null && this.isAnyGem(itemId)) {
+         return itemId;
+      }
+
+      ItemStack mainHand = player.getInventory().getItemInMainHand();
+      itemId = mainHand != null ? CustomItemManager.getIdByItem(mainHand) : null;
+      return itemId != null && this.isAnyGem(itemId) ? itemId : null;
+   }
+
+   public boolean hasGemInOffhand(Player player) {
+      String itemId = this.getHeldGemItemId(player);
+      if (itemId == null) {
+         return false;
+      } else if (GemType.isGem(itemId)) {
+         GemType type = GemType.fromOraxenId(itemId);
+         return type != null && this.plugin.getConfigManager().isGemEnabled(type);
+      } else {
+         GemRegistryImpl registry = this.plugin.getGemRegistry();
+         return registry != null && registry.isRegisteredGem(itemId);
+      }
+   }
+
+   public boolean hasGemTypeInOffhand(Player player, GemType type) {
+      if (!this.isGemOfType(player.getInventory().getItemInOffHand(), type) && !this.isGemOfType(player.getInventory().getItemInMainHand(), type)) {
+         if (this.plugin.getConfig().getBoolean("passives.apply-in-hotbar", true)) {
+            for (int slot = 0; slot < 9; slot++) {
+               if (this.isGemOfType(player.getInventory().getItem(slot), type)) {
+                  return true;
+               }
+            }
+         }
+
+         return false;
+      } else {
+         return true;
+      }
+   }
+
+   public boolean hasHarvestedSoul(Player player, GemType type) {
+      GoldGemManager gold = this.plugin.getGoldGemManager();
+      return gold != null && type != null ? gold.getHarvested(player.getUniqueId()).containsKey(type.getId()) && gold.holdsGoldGem(player) : false;
+   }
+
+   public int getTierFor(Player player, GemType type) {
+      if (type != null
+         && !this.isGemOfType(player.getInventory().getItemInOffHand(), type)
+         && !this.isGemOfType(player.getInventory().getItemInMainHand(), type)) {
+         GoldGemManager gold = this.plugin.getGoldGemManager();
+         GoldGemManager.Harvest soul = gold != null ? gold.getHarvested(player.getUniqueId()).get(type.getId()) : null;
+         if (soul != null) {
+            return soul.tier();
+         }
+
+         if (this.plugin.getConfig().getBoolean("passives.apply-in-hotbar", true)) {
+            for (int slot = 0; slot < 9; slot++) {
+               ItemStack it = player.getInventory().getItem(slot);
+               if (this.isGemOfType(it, type)) {
+                  String id = CustomItemManager.getIdByItem(it);
+                  if (id != null && GemType.isGem(id)) {
+                     return GemType.getTierFromOraxenId(id);
+                  }
+               }
+            }
+         }
+      }
+
+      return this.getTierFromOffhand(player);
+   }
+
+   private boolean isGemOfType(ItemStack item, GemType type) {
+      if (item == null) {
+         return false;
+      }
+
+      String itemId = CustomItemManager.getIdByItem(item);
+      return itemId != null && GemType.isGem(itemId) ? GemType.fromOraxenId(itemId) == type : false;
+   }
+
+   public GemType getGemTypeFromOffhand(Player player) {
+      String itemId = this.getHeldGemItemId(player);
+      return itemId != null && GemType.isGem(itemId) ? GemType.fromOraxenId(itemId) : null;
+   }
+
+   public String getGemIdFromOffhand(Player player) {
+      String itemId = this.getHeldGemItemId(player);
+      if (itemId == null) {
+         return null;
+      }
+
+      GemType type = GemType.fromOraxenId(itemId);
+      if (type != null) {
+         return type.getId();
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      return registry != null ? registry.gemIdFromItemId(itemId) : null;
+   }
+
+   public int getTierFromOffhand(Player player) {
+      String itemId = this.getHeldGemItemId(player);
+      if (itemId == null) {
+         return 1;
+      }
+
+      if (GemType.isGem(itemId)) {
+         return GemType.getTierFromOraxenId(itemId);
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      return registry != null && registry.isRegisteredGem(itemId) ? registry.tierFromItemId(itemId) : 1;
+   }
+
+   private String getPassiveGemItemId(Player player) {
+      String held = this.getHeldGemItemId(player);
+      if (held != null) {
+         return held;
+      }
+
+      if (!this.plugin.getConfig().getBoolean("passives.apply-in-hotbar", true)) {
+         return null;
+      }
+
+      for (int slot = 0; slot < 9; slot++) {
+         ItemStack it = player.getInventory().getItem(slot);
+         String id = it != null ? CustomItemManager.getIdByItem(it) : null;
+         if (id != null && this.isAnyGem(id)) {
+            return id;
+         }
+      }
+
+      return null;
+   }
+
+   public boolean hasGemForPassives(Player player) {
+      return this.getPassiveGemItemId(player) != null;
+   }
+
+   public GemType getGemTypeForPassives(Player player) {
+      String itemId = this.getPassiveGemItemId(player);
+      return itemId != null && GemType.isGem(itemId) ? GemType.fromOraxenId(itemId) : null;
+   }
+
+   public String getGemIdForPassives(Player player) {
+      String itemId = this.getPassiveGemItemId(player);
+      if (itemId == null) {
+         return null;
+      }
+
+      GemType type = GemType.fromOraxenId(itemId);
+      if (type != null) {
+         return type.getId();
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      return registry != null ? registry.gemIdFromItemId(itemId) : null;
+   }
+
+   public int getTierForPassives(Player player) {
+      String itemId = this.getPassiveGemItemId(player);
+      if (itemId == null) {
+         return 1;
+      }
+
+      if (GemType.isGem(itemId)) {
+         return GemType.getTierFromOraxenId(itemId);
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      return registry != null && registry.isRegisteredGem(itemId) ? registry.tierFromItemId(itemId) : 1;
+   }
+
+   public boolean giveGem(Player player, GemType type, int tier) {
+      String itemId = GemType.buildOraxenId(type, tier);
+      ItemStack gem = CustomItemManager.getItemById(itemId, this.plugin.getEnergyManager().getEnergy(player));
+      if (gem != null) {
+         player.getInventory().addItem(new ItemStack[]{gem});
+         this.updateActiveGem(player);
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   public boolean giveGem(Player player, String gemId, int tier) {
+      for (GemType type : GemType.values()) {
+         if (type.getId().equalsIgnoreCase(gemId)) {
+            return this.giveGem(player, type, tier);
+         }
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      ItemStack gem;
+      GemDefinition def;
+      if (registry != null
+         && (def = registry.getGem(gemId)) != null
+         && (gem = CustomItemManager.getItemById(def.buildItemId(tier), this.plugin.getEnergyManager().getEnergy(player))) != null) {
+         player.getInventory().addItem(new ItemStack[]{gem});
+         this.updateActiveGem(player);
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   public ItemStack findGemInInventory(Player player) {
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      ItemStack offhand = player.getInventory().getItemInOffHand();
+      String offId;
+      if (offhand == null
+         || (offId = CustomItemManager.getIdByItem(offhand)) == null
+         || !GemType.isGem(offId) && (registry == null || !registry.isRegisteredGem(offId))) {
+         for (ItemStack item : player.getInventory().getContents()) {
+            String itemId;
+            if (item != null && (itemId = CustomItemManager.getIdByItem(item)) != null) {
+               if (GemType.isGem(itemId)) {
+                  return item;
+               }
+
+               if (registry != null && registry.isRegisteredGem(itemId)) {
+                  return item;
+               }
+            }
+         }
+
+         for (ItemStack item : player.getEnderChest().getContents()) {
+            String itemId;
+            if (item != null && (itemId = CustomItemManager.getIdByItem(item)) != null) {
+               if (GemType.isGem(itemId)) {
+                  return item;
+               }
+
+               if (registry != null && registry.isRegisteredGem(itemId)) {
+                  return item;
+               }
+            }
+         }
+
+         return null;
+      } else {
+         return offhand;
+      }
+   }
+
+   public boolean isAnyGem(String itemId) {
+      if (itemId == null) {
+         return false;
+      }
+
+      if (GemType.isGem(itemId)) {
+         return true;
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      return registry != null && registry.isRegisteredGem(itemId);
+   }
+
+   public static GemType builtInType(String gemId) {
+      if (gemId == null) {
+         return null;
+      }
+
+      for (GemType type : GemType.values()) {
+         if (type.getId().equalsIgnoreCase(gemId)) {
+            return type;
+         }
+      }
+
+      return null;
+   }
+
+   public List<String> getAvailableGemIds() {
+      ArrayList<String> ids = new ArrayList<>();
+
+      for (GemType type : GemType.values()) {
+         if (this.plugin.getConfigManager().isGemEnabled(type)) {
+            ids.add(type.getId());
+         }
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      if (registry != null) {
+         List excluded = this.plugin.getConfig().contains("gems.exclude-from-random")
+            ? this.plugin.getConfig().getStringList("gems.exclude-from-random")
+            : List.of("auratus", "heretic", "gold");
+
+         for (GemDefinition def : registry.getAllGems()) {
+            if (!"gold".equals(def.getId()) && builtInType(def.getId()) == null && !ids.contains(def.getId()) && !excluded.contains(def.getId())) {
+               ids.add(def.getId());
+            }
+         }
+      }
+
+      return ids;
+   }
+
+   public String getGemDisplayName(String gemId) {
+      GemType type = builtInType(gemId);
+      if (type != null) {
+         return type.getDisplayName();
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      GemDefinition def = registry != null ? registry.getGem(gemId) : null;
+      return def != null ? def.getDisplayName() : gemId;
+   }
+
+   public String getGemColorCode(String gemId) {
+      GemType type = builtInType(gemId);
+      if (type != null) {
+         return type.getColor();
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      GemDefinition def = registry != null ? registry.getGem(gemId) : null;
+      return def != null ? def.getColor() : "§7";
+   }
+
+   public boolean giveGemToOffhand(Player player, String gemId, int tier) {
+      GemType type = builtInType(gemId);
+      if (type != null) {
+         return this.giveGemToOffhand(player, type, tier);
+      }
+
+      GemRegistryImpl registry = this.plugin.getGemRegistry();
+      GemDefinition def = registry != null ? registry.getGem(gemId) : null;
+      if (def == null) {
+         return false;
+      }
+
+      String itemId = def.buildItemId(tier);
+      ItemStack gem = CustomItemManager.getItemById(itemId, this.plugin.getEnergyManager().getEnergy(player));
+      if (gem == null) {
+         return false;
+      }
+
+      ItemStack current = player.getInventory().getItemInOffHand();
+      if (current != null && !current.getType().isAir()) {
+         player.getInventory().addItem(new ItemStack[]{gem});
+      } else {
+         player.getInventory().setItemInOffHand(gem);
+      }
+
+      this.updateActiveGem(player);
+      return true;
+   }
+
+   public boolean replaceGemType(Player player, GemType newType) {
+      return this.replaceGem(player, newType.getId());
+   }
+
+   public boolean replaceGem(Player player, String newGemId) {
+      if (newGemId == null) {
+         return false;
+      }
+
+      ItemStack currentGem = this.findGemInInventory(player);
+      if (CustomItemManager.isGoldSkinned(currentGem)) {
+         player.sendMessage("§6The Gold Gem's soul can only be changed with /bliss gold.");
+         return false;
+      }
+
+      if (currentGem == null) {
+         return false;
+      }
+
+      String currentId = CustomItemManager.getIdByItem(currentGem);
+      if (currentId == null) {
+         return false;
+      }
+
+      int tier = GemType.getTierFromOraxenId(currentId);
+      String newId = newGemId + "_gem_t" + tier;
+      ItemStack newGem = CustomItemManager.getItemById(newId, this.plugin.getEnergyManager().getEnergy(player));
+      if (newGem == null) {
+         return false;
+      }
+
+      for (int i = 0; i < player.getInventory().getSize(); i++) {
+         ItemStack item = player.getInventory().getItem(i);
+         if (item != null && item.equals(currentGem)) {
+            player.getInventory().setItem(i, newGem);
+            this.updateActiveGem(player);
+            return true;
+         }
+      }
+
+      ItemStack offhand = player.getInventory().getItemInOffHand();
+      if (offhand != null && offhand.equals(currentGem)) {
+         player.getInventory().setItemInOffHand(newGem);
+         this.updateActiveGem(player);
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   public boolean giveGemToOffhand(Player player, GemType type, int tier) {
+      String itemId = GemType.buildOraxenId(type, tier);
+      ItemStack gem = CustomItemManager.getItemById(itemId, this.plugin.getEnergyManager().getEnergy(player));
+      if (gem == null) {
+         return false;
+      }
+
+      ItemStack current = player.getInventory().getItemInOffHand();
+      if (current != null && !current.getType().isAir()) {
+         player.getInventory().addItem(new ItemStack[]{gem});
+      } else {
+         player.getInventory().setItemInOffHand(gem);
+      }
+
+      this.updateActiveGem(player);
+      return true;
+   }
+
+   public boolean upgradeGem(Player player, GemType type) {
+      return type != null && this.upgradeGem(player, type.getId());
+   }
+
+   public boolean upgradeGem(Player player, String gemId) {
+      if (gemId == null) {
+         return false;
+      }
+
+      ItemStack currentGem = this.findGemInInventory(player);
+      if (CustomItemManager.isGoldSkinned(currentGem)) {
+         player.sendMessage("§6The Gold Gem's soul can only be changed with /bliss gold.");
+         return false;
+      }
+
+      if (currentGem == null) {
+         return false;
+      }
+
+      String currentId = CustomItemManager.getIdByItem(currentGem);
+      if (currentId == null) {
+         return false;
+      }
+
+      if (!currentId.equals(gemId + "_gem_t1")) {
+         return false;
+      }
+
+      if (builtInType(gemId) == null) {
+         GemRegistryImpl registry = this.plugin.getGemRegistry();
+         GemDefinition def = registry != null ? registry.getGem(gemId) : null;
+         if (def == null || def.getMaxTier() < 2) {
+            return false;
+         }
+      }
+
+      ItemStack newGem;
+      if ((newGem = CustomItemManager.getItemById(gemId + "_gem_t2", this.plugin.getEnergyManager().getEnergy(player))) == null) {
+         return false;
+      }
+
+      for (int i = 0; i < player.getInventory().getSize(); i++) {
+         ItemStack item = player.getInventory().getItem(i);
+         if (item != null && item.equals(currentGem)) {
+            player.getInventory().setItem(i, newGem);
+            this.updateActiveGem(player);
+            return true;
+         }
+      }
+
+      ItemStack offhand = player.getInventory().getItemInOffHand();
+      if (offhand != null && offhand.equals(currentGem)) {
+         player.getInventory().setItemInOffHand(newGem);
+         this.updateActiveGem(player);
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   public boolean downgradeGem(Player player, String gemId) {
+      if (gemId == null) {
+         return false;
+      }
+
+      ItemStack currentGem = this.findGemInInventory(player);
+      if (currentGem == null) {
+         return false;
+      }
+
+      String currentId = CustomItemManager.getIdByItem(currentGem);
+      if (currentId != null && currentId.equals(gemId + "_gem_t2")) {
+         int energy = this.plugin.getEnergyManager().getEnergy(player);
+         ItemStack t1Gem = CustomItemManager.getItemById(gemId + "_gem_t1", energy);
+         if (t1Gem == null) {
+            return false;
+         }
+
+         for (int i = 0; i < player.getInventory().getSize(); i++) {
+            ItemStack item = player.getInventory().getItem(i);
+            if (item != null && item.equals(currentGem)) {
+               player.getInventory().setItem(i, t1Gem);
+               this.updateActiveGem(player);
+               return true;
+            }
+         }
+
+         ItemStack offhand = player.getInventory().getItemInOffHand();
+         if (offhand != null && offhand.equals(currentGem)) {
+            player.getInventory().setItemInOffHand(t1Gem);
+            this.updateActiveGem(player);
+            return true;
+         } else {
+            return false;
+         }
+      } else {
+         return false;
+      }
+   }
+
+   public void updateGemTextures(Player player) {
+      CustomItemManager.migrateGemMaterials(player.getInventory());
+      int energy = this.plugin.getEnergyManager().getEnergy(player);
+
+      for (ItemStack item : player.getInventory().getContents()) {
+         if (item != null) {
+            CustomItemManager.updateGemTexture(item, energy);
+         }
+      }
+   }
+
+   public void clearCache(UUID uuid) {
+      this.activeGems.remove(uuid);
+   }
+
+   public static class ActiveGem {
+      private final GemType type;
+      private final String gemId;
+      private final int tier;
+
+      public ActiveGem(GemType type, int tier) {
+         this.type = type;
+         this.gemId = type != null ? type.getId() : null;
+         this.tier = tier;
+      }
+
+      public ActiveGem(String gemId, int tier) {
+         this.type = null;
+         this.gemId = gemId;
+         this.tier = tier;
+      }
+
+      public GemType getType() {
+         return this.type;
+      }
+
+      public String getGemId() {
+         return this.gemId;
+      }
+
+      public int getTier() {
+         return this.tier;
+      }
+   }
+}

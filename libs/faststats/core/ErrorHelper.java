@@ -1,0 +1,234 @@
+package dev.xoperr.blissgems.libs.faststats.core;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
+import org.jspecify.annotations.Nullable;
+
+final class ErrorHelper {
+   private static final int MESSAGE_LENGTH = Math.min(1000, Integer.getInteger("faststats.message-length", 500));
+   private static final int STACK_TRACE_LENGTH = Math.min(500, Integer.getInteger("faststats.stack-trace-length", 300));
+   private static final int STACK_TRACE_LIMIT = Math.min(50, Integer.getInteger("faststats.stack-trace-limit", 15));
+   private static final Pattern IPV4_PATTERN = Pattern.compile("\\b(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\b");
+   private static final Pattern IPV6_PATTERN = Pattern.compile(
+      "(?i)\\b([0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\\b|(?i)\\b([0-9a-f]{1,4}:){1,7}:\\b|(?i)\\b([0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}\\b|(?i)\\b([0-9a-f]{1,4}:){1,5}(:[0-9a-f]{1,4}){1,2}\\b|(?i)\\b([0-9a-f]{1,4}:){1,4}(:[0-9a-f]{1,4}){1,3}\\b|(?i)\\b([0-9a-f]{1,4}:){1,3}(:[0-9a-f]{1,4}){1,4}\\b|(?i)\\b([0-9a-f]{1,4}:){1,2}(:[0-9a-f]{1,4}){1,5}\\b|(?i)\\b[0-9a-f]{1,4}:(:[0-9a-f]{1,4}){1,6}\\b|(?i)\\b:(:[0-9a-f]{1,4}){1,7}\\b|(?i)\\b::([0-9a-f]{1,4}:){0,5}[0-9a-f]{1,4}\\b|(?i)\\b::\\b"
+   );
+   private static final Pattern USER_HOME_PATH_PATTERN = Pattern.compile("(/home/)[^/\\s]+|(/Users/)[^/\\s]+|((?i)[A-Z]:\\\\Users\\\\)[^\\\\\\s]+");
+
+   public static JsonObject compile(Throwable error, @Nullable List<String> suppress) {
+      JsonObject report = new JsonObject();
+      String message = getAnonymizedMessage(error);
+      JsonArray stacktrace = new JsonArray();
+      String header = message != null ? error.getClass().getName() + ": " + message : error.getClass().getName();
+      stacktrace.add(header);
+      StackTraceElement[] elements = error.getStackTrace();
+      List<String> stack = collapseStackTrace(elements);
+      ArrayList<String> list = new ArrayList<>(stack);
+      if (suppress != null) {
+         list.removeAll(suppress);
+      }
+
+      int traces = Math.min(list.size(), STACK_TRACE_LIMIT);
+      populateTraces(traces, list, elements, stacktrace);
+      appendCauseChain(error.getCause(), stack, suppress, stacktrace);
+      report.addProperty("error", error.getClass().getName());
+      if (message != null) {
+         report.addProperty("message", message);
+      }
+
+      report.add("stack", stacktrace);
+      return report;
+   }
+
+   private static void appendCauseChain(@Nullable Throwable cause, List<String> parentStack, @Nullable List<String> suppress, JsonArray stacktrace) {
+      ArrayList<String> toSuppress = new ArrayList<>(parentStack);
+      if (suppress != null) {
+         toSuppress.addAll(suppress);
+      }
+
+      Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+
+      while (cause != null && visited.add(cause)) {
+         String causeMessage = getAnonymizedMessage(cause);
+         String header = causeMessage != null ? "Caused by: " + cause.getClass().getName() + ": " + causeMessage : "Caused by: " + cause.getClass().getName();
+         stacktrace.add(header);
+         StackTraceElement[] causeElements = cause.getStackTrace();
+         List<String> causeStack = collapseStackTrace(causeElements);
+         ArrayList<String> causeList = new ArrayList<>(causeStack);
+         causeList.removeAll(toSuppress);
+         int causeTraces = Math.min(causeList.size(), STACK_TRACE_LIMIT);
+         populateTraces(causeTraces, causeList, causeElements, stacktrace);
+         cause = cause.getCause();
+      }
+   }
+
+   private static void populateTraces(int traces, List<String> list, StackTraceElement[] elements, JsonArray stacktrace) {
+      for (int i = 0; i < traces; i++) {
+         String string = list.get(i);
+         if (string.length() <= STACK_TRACE_LENGTH) {
+            stacktrace.add("  at " + string);
+         } else {
+            stacktrace.add("  at " + string.substring(0, STACK_TRACE_LENGTH) + "...");
+         }
+      }
+
+      if (traces > 0 && traces < list.size()) {
+         stacktrace.add("  ... " + (list.size() - traces) + " more");
+      } else {
+         int i = elements.length - list.size();
+         if (i > 0) {
+            stacktrace.add("  ... " + i + " more");
+         }
+      }
+   }
+
+   private static List<String> collapseStackTrace(StackTraceElement[] trace) {
+      List<String> lines = Arrays.stream(trace).map(StackTraceElement::toString).toList();
+      return collapseRepeatingPattern(lines);
+   }
+
+   private static List<String> collapseRepeatingPattern(List<String> lines) {
+      List<String> deduplicated = collapseConsecutiveDuplicates(lines);
+      int n = deduplicated.size();
+
+      for (int cycleLen = 1; cycleLen <= n / 2; cycleLen++) {
+         boolean isPattern = true;
+         int repetitions = 0;
+
+         for (int i = 0; i < n; i++) {
+            if (!deduplicated.get(i).equals(deduplicated.get(i % cycleLen))) {
+               isPattern = false;
+               break;
+            }
+
+            if (i > 0 && i % cycleLen == 0) {
+               repetitions++;
+            }
+         }
+
+         if (isPattern && repetitions >= 2) {
+            return deduplicated.subList(0, cycleLen);
+         }
+      }
+
+      return deduplicated;
+   }
+
+   private static List<String> collapseConsecutiveDuplicates(List<String> lines) {
+      if (lines.isEmpty()) {
+         return lines;
+      }
+
+      ArrayList<String> result = new ArrayList<>();
+      String previous = null;
+
+      for (String line : lines) {
+         if (!line.equals(previous)) {
+            result.add(line);
+            previous = line;
+         }
+      }
+
+      return result;
+   }
+
+   public static boolean isSameLoader(ClassLoader loader, Throwable error) {
+      return isSameLoader(loader, error, Collections.newSetFromMap(new IdentityHashMap<>()));
+   }
+
+   private static boolean isSameLoader(ClassLoader loader, @Nullable Throwable error, Set<Throwable> visited) {
+      if (error != null && visited.add(error)) {
+         StackTraceElement[] stackTrace = error.getStackTrace();
+         if (stackTrace != null && stackTrace.length != 0) {
+            int firstNonLibraryIndex = findFirstNonLibraryFrameIndex(stackTrace);
+            if (firstNonLibraryIndex == -1) {
+               return isSameLoader(loader, error.getCause(), visited);
+            }
+
+            int framesToCheck = Math.min(5, stackTrace.length - firstNonLibraryIndex);
+
+            for (int i = 0; i < framesToCheck; i++) {
+               StackTraceElement frame = stackTrace[firstNonLibraryIndex + i];
+               if (!isLibraryClass(frame.getClassName()) && !isFromLoader(frame, loader)) {
+                  return isSameLoader(loader, error.getCause(), visited);
+               }
+            }
+
+            return true;
+         } else {
+            return isSameLoader(loader, error.getCause(), visited);
+         }
+      } else {
+         return false;
+      }
+   }
+
+   private static int findFirstNonLibraryFrameIndex(StackTraceElement[] stackTrace) {
+      for (int i = 0; i < stackTrace.length; i++) {
+         if (!isLibraryClass(stackTrace[i].getClassName())) {
+            return i;
+         }
+      }
+
+      return -1;
+   }
+
+   private static boolean isLibraryClass(String className) {
+      return className.startsWith("java.")
+         || className.startsWith("javax.")
+         || className.startsWith("sun.")
+         || className.startsWith("com.sun.")
+         || className.startsWith("jdk.");
+   }
+
+   private static boolean isFromLoader(StackTraceElement frame, ClassLoader loader) {
+      try {
+         Class<?> clazz = Class.forName(frame.getClassName(), false, loader);
+         return isSameClassLoader(clazz.getClassLoader(), loader);
+      } catch (Throwable t) {
+         return false;
+      }
+   }
+
+   private static boolean isSameClassLoader(ClassLoader classLoader, ClassLoader loader) {
+      if (classLoader == loader) {
+         return true;
+      }
+
+      ClassLoader current = classLoader;
+
+      while (current != null && current != loader) {
+         current = current.getParent();
+      }
+
+      return loader == current;
+   }
+
+   private static String anonymize(String message) {
+      message = IPV4_PATTERN.matcher(message).replaceAll("[IP hidden]");
+      message = IPV6_PATTERN.matcher(message).replaceAll("[IP hidden]");
+      message = USER_HOME_PATH_PATTERN.matcher(message).replaceAll("$1$2$3[username hidden]");
+      String username = System.getProperty("user.name");
+      if (username != null) {
+         message = message.replace(username, "[username hidden]");
+      }
+
+      return message;
+   }
+
+   private static @Nullable String getAnonymizedMessage(Throwable error) {
+      String message = error.getMessage();
+      if (message == null) {
+         return null;
+      }
+
+      String truncated = message.length() > MESSAGE_LENGTH ? message.substring(0, MESSAGE_LENGTH) + "..." : message;
+      return anonymize(truncated);
+   }
+}

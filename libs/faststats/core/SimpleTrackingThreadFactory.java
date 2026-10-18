@@ -1,0 +1,37 @@
+package dev.xoperr.blissgems.libs.faststats.core;
+
+import dev.xoperr.blissgems.libs.faststats.core.concurrent.TrackingThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+
+final class SimpleTrackingThreadFactory implements TrackingThreadFactory {
+   private static final AtomicInteger poolNumber = new AtomicInteger(1);
+   private final ThreadGroup group;
+   private final AtomicInteger threadNumber = new AtomicInteger(1);
+   private final String namePrefix;
+   private final ErrorTracker tracker;
+
+   public SimpleTrackingThreadFactory(ErrorTracker tracker) {
+      this.tracker = tracker;
+      this.group = Thread.currentThread().getThreadGroup();
+      this.namePrefix = "tracking-pool-" + poolNumber.getAndIncrement() + "-thread-";
+   }
+
+   @Override
+   public Thread newThread(Runnable runnable) {
+      return this.newThread(this.namePrefix + this.threadNumber.getAndIncrement(), runnable);
+   }
+
+   @Override
+   public Thread newThread(String name, Runnable runnable) {
+      Thread thread = new Thread(this.group, this.tracker.base().tracked(runnable), name, 0L);
+      if (thread.isDaemon()) {
+         thread.setDaemon(false);
+      }
+
+      if (thread.getPriority() != 5) {
+         thread.setPriority(5);
+      }
+
+      return thread;
+   }
+}

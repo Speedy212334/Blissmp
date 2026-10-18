@@ -1,0 +1,611 @@
+package dev.xoperr.blissgems.abilities;
+
+import dev.xoperr.blissgems.BlissGems;
+import dev.xoperr.blissgems.api.GemAbilityHandler;
+import dev.xoperr.blissgems.utils.ParticleUtils;
+import dev.xoperr.blissgems.utils.PlayerCloneNPC;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import org.bukkit.Color;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.Particle;
+import org.bukkit.Sound;
+import org.bukkit.World;
+import org.bukkit.Particle.DustOptions;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.Snowball;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.RayTraceResult;
+import org.bukkit.util.Vector;
+
+public class SpeedAbilities implements GemAbilityHandler {
+   private final BlissGems plugin;
+   private final Set<UUID> speedStormActivePlayers = new HashSet<>();
+   private final Map<UUID, BukkitTask> speedStormTasks = new HashMap<>();
+   private final Map<UUID, Set<UUID>> speedStormVictims = new HashMap<>();
+   private static final Set<UUID> frozenPlayers = new HashSet<>();
+   private static final long CLONE_WINDUP_TICKS = 5L;
+   private static final long CLONE_LIFETIME_TICKS = 20L;
+   private final Map<UUID, Integer> blurCharges = new HashMap<>();
+   private final Map<UUID, BukkitTask> blurExpiryTasks = new HashMap<>();
+   private final Map<UUID, Integer> galeCharges = new HashMap<>();
+   private final Map<UUID, BukkitTask> galeExpiryTasks = new HashMap<>();
+   public static final String GALE_CLOUD_TAG = "blissgems_gale_cloud";
+
+   public SpeedAbilities(BlissGems plugin) {
+      this.plugin = plugin;
+   }
+
+   public static boolean isPlayerFrozen(UUID playerId) {
+      return frozenPlayers.contains(playerId);
+   }
+
+   public static void freezePlayer(UUID playerId) {
+      frozenPlayers.add(playerId);
+   }
+
+   public static void unfreezePlayer(UUID playerId) {
+      frozenPlayers.remove(playerId);
+   }
+
+   public void onRightClick(Player player, int tier) {
+      if (tier == 2 && player.isSneaking()) {
+         this.speedStorm(player);
+      } else {
+         this.blur(player);
+      }
+   }
+
+   @Override
+   public void onPrimary(Player player, int tier) {
+      this.onRightClick(player, tier);
+   }
+
+   @Override
+   public void onSecondary(Player player, int tier) {
+      this.speedStorm(player);
+   }
+
+   @Override
+   public void onTertiary(Player player, int tier) {
+      this.activateTerminalVelocity(player);
+   }
+
+   @Override
+   public void onQuaternary(Player player, int tier) {
+      this.lightningBackstab(player);
+   }
+
+   public void lightningBackstab(Player player) {
+      if (this.plugin.getGemManager().getGemTier(player) < 2) {
+         player.sendMessage("§c§oThis ability requires Tier 2!");
+      } else {
+         String abilityKey = "speed-gale-clouds";
+         if (this.plugin.getAbilityManager().canUseAbility(player, abilityKey)) {
+            int range = this.plugin.getConfig().getInt("abilities.speed-4th.range", 20);
+            Player target = this.getTargetPlayer(player, range);
+            if (target == null) {
+               player.sendMessage("§cNo target player found in range (" + range + "m)!");
+            } else if (target.equals(player)) {
+               player.sendMessage("§cCannot target yourself!");
+            } else if (this.plugin.getTrustedPlayersManager() != null && this.plugin.getTrustedPlayersManager().isTrusted(player, target)) {
+               player.sendMessage("§cCannot target a trusted player!");
+            } else {
+               Location departure = player.getLocation().clone();
+               Vector targetDir = target.getLocation().getDirection().setY(0).normalize();
+               if (targetDir.lengthSquared() < 0.01) {
+                  targetDir = new Vector(0, 0, -1);
+               }
+
+               Location behind = target.getLocation().clone().subtract(targetDir.multiply(1.5));
+               behind.setPitch(target.getLocation().getPitch());
+               behind.setYaw(target.getLocation().getYaw());
+               player.teleport(behind);
+               World world = player.getWorld();
+               Vector step = behind.toVector().subtract(departure.toVector());
+               double dist = step.length();
+               if (dist > 0.0) {
+                  step.normalize().multiply(0.5);
+                  Location current = departure.clone();
+                  DustOptions yellow = new DustOptions(Color.fromRGB(255, 255, 100), 1.2F);
+
+                  for (double d = 0.0; d < dist; d += 0.5) {
+                     world.spawnParticle(Particle.ELECTRIC_SPARK, current, 2, 0.1, 0.1, 0.1, 0.05);
+                     world.spawnParticle(Particle.DUST, current, 1, 0.05, 0.05, 0.05, 0.0, yellow, true);
+                     current.add(step);
+                  }
+               }
+
+               world.strikeLightningEffect(behind);
+               world.playSound(behind, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 1.0F, 1.2F);
+               world.playSound(behind, Sound.ENTITY_LIGHTNING_BOLT_IMPACT, 1.0F, 1.4F);
+               double currentHp = target.getHealth();
+               double newHp = Math.max(0.0, currentHp - 6.0);
+               target.setHealth(newHp);
+               target.playHurtAnimation(player.getLocation().getYaw());
+               target.getWorld().playSound(target.getLocation(), Sound.ENTITY_PLAYER_HURT, 1.0F, 1.0F);
+               target.setCooldown(Material.WIND_CHARGE, 100);
+               target.sendMessage("§c§l⚡ Your wind charges have been disabled for 5 seconds!");
+               target.sendMessage("§c§l⚡ " + player.getName() + " struck you from behind dealing 3 hearts true damage!");
+               player.sendMessage("§b§l⚡ Teleported behind §f" + target.getName() + "§b dealing §c3 hearts true damage§b!");
+               this.plugin.getAbilityManager().useAbility(player, abilityKey);
+            }
+         }
+      }
+   }
+
+   private Player getTargetPlayer(Player player, int range) {
+      RayTraceResult result = player.getWorld()
+         .rayTraceEntities(player.getEyeLocation(), player.getEyeLocation().getDirection(), range, 0.5, entity -> entity instanceof Player && entity != player);
+      if (result != null && result.getHitEntity() instanceof Player target) {
+         return target;
+      }
+
+      Player best = null;
+      double bestDist = (double)range * range;
+
+      for (Player p : player.getWorld().getPlayers()) {
+         if (!p.equals(player) && player.canSee(p)) {
+            double d = p.getLocation().distanceSquared(player.getLocation());
+            if (d <= bestDist) {
+               Vector toTarget = p.getLocation().toVector().subtract(player.getLocation().toVector()).normalize();
+               if (player.getLocation().getDirection().dot(toTarget) > 0.6) {
+                  best = p;
+                  bestDist = d;
+               }
+            }
+         }
+      }
+
+      return best;
+   }
+
+   @Override
+   public void cleanup(Player player) {
+      this.cleanup(player.getUniqueId());
+   }
+
+   public void activateTerminalVelocity(Player player) {
+      if (this.plugin.getGemManager().getGemTier(player) < 2) {
+         player.sendMessage("§c§oThis ability requires Tier 2!");
+      } else {
+         this.terminalVelocity(player);
+      }
+   }
+
+   public boolean isSpeedStormActive(Player player) {
+      return this.speedStormActivePlayers.contains(player.getUniqueId());
+   }
+
+   public int getBlurCharges(UUID playerId) {
+      return this.blurCharges.getOrDefault(playerId, 0);
+   }
+
+   public void blur(final Player player) {
+      final UUID uuid = player.getUniqueId();
+      if (this.blurCharges.getOrDefault(uuid, 0) > 0) {
+         this.fireBlurStrike(player);
+      } else {
+         String abilityKey = "speed-blur";
+         if (this.plugin.getAbilityManager().canUseAbility(player, abilityKey)) {
+            int strikeCount = this.plugin.getConfig().getInt("abilities.blur.strikes", 5);
+            int timeoutSeconds = this.plugin.getConfig().getInt("abilities.blur.charge-timeout-seconds", 30);
+            this.blurCharges.put(uuid, strikeCount);
+            DustOptions yellowDust = new DustOptions(ParticleUtils.SPEED_YELLOW, 2.0F);
+            player.playSound(player.getLocation(), Sound.ENTITY_BREEZE_SHOOT, 1.0F, 2.0F);
+            player.playSound(player.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 1.0F, 1.8F);
+            player.spawnParticle(Particle.DUST, player.getLocation().add(0.0, 1.0, 0.0), 150, 0.8, 0.8, 0.8, 0.0, yellowDust, true);
+            player.spawnParticle(Particle.ELECTRIC_SPARK, player.getLocation().add(0.0, 1.0, 0.0), 80, 0.8, 0.8, 0.8);
+            player.spawnParticle(Particle.GUST, player.getLocation().add(0.0, 4.0, 0.0), 40, 0.5, 0.5, 0.5);
+            BukkitTask expiry = (new BukkitRunnable() {
+               public void run() {
+                  SpeedAbilities.this.blurExpiryTasks.remove(uuid);
+                  SpeedAbilities.this.blurCharges.remove(uuid);
+                  SpeedAbilities.this.plugin.getAbilityManager().endAbilityDuration(player, "speed-blur");
+               }
+            }).runTaskLater(this.plugin, timeoutSeconds * 20L);
+            BukkitTask oldExpiry = this.blurExpiryTasks.put(uuid, expiry);
+            if (oldExpiry != null) {
+               oldExpiry.cancel();
+            }
+
+            this.plugin.getAbilityManager().useAbilityWithDuration(player, abilityKey, timeoutSeconds);
+            String msg = this.plugin.getConfigManager().getFormattedMessage("ability-activated", "ability", "Blur");
+            if (msg != null && !msg.isEmpty()) {
+               player.sendMessage(msg);
+            }
+         }
+      }
+   }
+
+   public void galeClouds(Player player) {
+      final UUID uuid = player.getUniqueId();
+      if (this.galeCharges.getOrDefault(uuid, 0) > 0) {
+         this.throwGaleCloud(player);
+      } else {
+         String abilityKey = "speed-gale-clouds";
+         if (this.plugin.getAbilityManager().canUseAbility(player, abilityKey)) {
+            int cloudCount = this.plugin.getConfig().getInt("abilities.gale-clouds.clouds", 3);
+            int timeoutSeconds = this.plugin.getConfig().getInt("abilities.gale-clouds.charge-timeout-seconds", 20);
+            this.galeCharges.put(uuid, cloudCount);
+            BukkitTask expiry = (new BukkitRunnable() {
+               public void run() {
+                  SpeedAbilities.this.galeExpiryTasks.remove(uuid);
+                  SpeedAbilities.this.galeCharges.remove(uuid);
+               }
+            }).runTaskLater(this.plugin, timeoutSeconds * 20L);
+            BukkitTask oldExpiry = this.galeExpiryTasks.put(uuid, expiry);
+            if (oldExpiry != null) {
+               oldExpiry.cancel();
+            }
+
+            this.plugin.getAbilityManager().useAbility(player, abilityKey);
+            player.playSound(player.getLocation(), Sound.ENTITY_BREEZE_INHALE, 1.0F, 1.4F);
+            String msg = this.plugin.getConfigManager().getFormattedMessage("ability-activated", "ability", "Gale Clouds");
+            if (msg != null && !msg.isEmpty()) {
+               player.sendMessage(msg);
+            }
+
+            this.throwGaleCloud(player);
+         }
+      }
+   }
+
+   private void throwGaleCloud(Player player) {
+      UUID uuid = player.getUniqueId();
+      int remaining = this.galeCharges.getOrDefault(uuid, 0);
+      if (remaining > 0) {
+         Snowball cloud = (Snowball)player.launchProjectile(Snowball.class);
+         cloud.setVelocity(player.getLocation().getDirection().multiply(1.4));
+         cloud.addScoreboardTag("blissgems_gale_cloud");
+         cloud.setItem(new ItemStack(Material.WHITE_DYE));
+         player.getWorld().spawnParticle(Particle.CLOUD, player.getEyeLocation(), 15, 0.2, 0.2, 0.2, 0.02);
+         player.playSound(player.getLocation(), Sound.ENTITY_BREEZE_SHOOT, 0.9F, 1.6F);
+         if (--remaining <= 0) {
+            this.galeCharges.remove(uuid);
+            BukkitTask expiry = this.galeExpiryTasks.remove(uuid);
+            if (expiry != null) {
+               expiry.cancel();
+            }
+         } else {
+            this.galeCharges.put(uuid, remaining);
+         }
+
+         player.sendMessage("§e§oGale Cloud thrown! §7(" + remaining + " left)");
+      }
+   }
+
+   public void spawnGaleCloud(final Location center, final Player thrower) {
+      final double radius = this.plugin.getConfig().getDouble("abilities.gale-clouds.radius", 3.5);
+      final int durationSeconds = this.plugin.getConfig().getInt("abilities.gale-clouds.duration-seconds", 5);
+      final int slownessLevel = this.plugin.getConfig().getInt("abilities.gale-clouds.slowness-level", 2);
+      final int slownessSeconds = this.plugin.getConfig().getInt("abilities.gale-clouds.slowness-duration-seconds", 4);
+      final int windChargeSeconds = this.plugin.getConfig().getInt("abilities.gale-clouds.wind-charge-cooldown-seconds", 8);
+      center.getWorld().playSound(center, Sound.ENTITY_BREEZE_LAND, 1.0F, 1.2F);
+      (new BukkitRunnable() {
+         int ticks = 0;
+         final int maxTicks = durationSeconds * 20;
+
+         public void run() {
+            if (this.ticks >= this.maxTicks) {
+               this.cancel();
+            } else {
+               for (int i = 0; i < 6; i++) {
+                  double angle = this.ticks / 8.0 + i / 6.0 * 2.0 * Math.PI;
+                  double x = Math.cos(angle) * radius * 0.8;
+                  double z = Math.sin(angle) * radius * 0.8;
+                  center.getWorld().spawnParticle(Particle.CLOUD, center.clone().add(x, 0.4, z), 2, 0.15, 0.15, 0.15, 0.01);
+               }
+
+               center.getWorld().spawnParticle(Particle.GUST, center.clone().add(0.0, 0.5, 0.0), 1, 0.4, 0.2, 0.4, 0.0);
+               if (this.ticks % 10 == 0) {
+                  for (Entity entity : center.getWorld().getNearbyEntities(center, radius, radius, radius)) {
+                     LivingEntity living;
+                     if (entity instanceof LivingEntity && !(living = (LivingEntity)entity).equals(thrower)) {
+                        living.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, slownessSeconds * 20, Math.max(0, slownessLevel - 1), true, true));
+                        if (living instanceof Player hit) {
+                           hit.setCooldown(Material.WIND_CHARGE, windChargeSeconds * 20);
+                        }
+                     }
+                  }
+               }
+
+               this.ticks++;
+            }
+         }
+      }).runTaskTimer(this.plugin, 0L, 1L);
+   }
+
+   private void fireBlurStrike(final Player player) {
+      UUID uuid = player.getUniqueId();
+      int remaining = this.blurCharges.getOrDefault(uuid, 0);
+      if (remaining > 0) {
+         final double damage = this.plugin.getConfigManager().getAbilityDamage("blur");
+         final double knockbackPower = this.plugin.getConfig().getDouble("abilities.blur.knockback", 0.4);
+         final Location strikeLoc = player.getTargetBlock(null, 20).getLocation().add(0.5, 1.0, 0.5);
+         strikeLoc.getWorld().strikeLightningEffect(strikeLoc);
+         final DustOptions strikeDust = new DustOptions(ParticleUtils.SPEED_YELLOW, 2.5F);
+         strikeLoc.getWorld().spawnParticle(Particle.DUST, strikeLoc, 250, 1.5, 2.0, 1.5, 0.0, strikeDust, true);
+         strikeLoc.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, strikeLoc, 150, 1.2, 1.5, 1.2, 0.1);
+         Location cloudLoc = strikeLoc.clone().add(0.0, 3.0, 0.0);
+         strikeLoc.getWorld().spawnParticle(Particle.EXPLOSION, cloudLoc, 8, 1.0, 0.5, 1.0);
+         strikeLoc.getWorld().spawnParticle(Particle.GUST, cloudLoc, 60, 1.0, 0.5, 1.0);
+
+         for (int i = 0; i < 32; i++) {
+            double angle = i / 32.0 * 2.0 * Math.PI;
+            double x = Math.cos(angle) * 3.0;
+            double z = Math.sin(angle) * 3.0;
+            strikeLoc.getWorld().spawnParticle(Particle.DUST, strikeLoc.clone().add(x, 0.2, z), 8, 0.2, 0.1, 0.2, 0.0, strikeDust, true);
+         }
+
+         strikeLoc.getWorld().playSound(strikeLoc, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 1.5F, 1.0F);
+         strikeLoc.getWorld().playSound(strikeLoc, Sound.ENTITY_GENERIC_EXPLODE, 0.8F, 1.2F);
+         PlayerCloneNPC.play(this.plugin, player, strikeLoc, 5L, 20L);
+         (new BukkitRunnable() {
+               public void run() {
+                  strikeLoc.getWorld().playSound(strikeLoc, Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1.2F, 1.4F);
+                  strikeLoc.getWorld().spawnParticle(Particle.SWEEP_ATTACK, strikeLoc.clone().add(0.0, 1.0, 0.0), 3, 0.6, 0.3, 0.6, 0.0);
+
+                  for (Entity entity : strikeLoc.getWorld().getNearbyEntities(strikeLoc, 3.5, 3.5, 3.5)) {
+                     if (entity instanceof LivingEntity target
+                        && !entity.equals(player)
+                        && !(entity instanceof Player targetPlayer && SpeedAbilities.this.plugin.getTrustedPlayersManager().isTrusted(player, targetPlayer))) {
+                        target.damage(damage, player);
+                        final LivingEntity knockTarget = target;
+                        final Location knockOrigin = strikeLoc.clone();
+                        (new BukkitRunnable() {
+                           public void run() {
+                              if (knockTarget.isValid() && !knockTarget.isDead()) {
+                                 Vector away = knockTarget.getLocation().toVector().subtract(knockOrigin.toVector());
+                                 if (away.lengthSquared() < 1.0E-4 && (away = knockOrigin.getDirection().setY(0)).lengthSquared() < 1.0E-4) {
+                                    away = new Vector(1, 0, 0);
+                                 }
+
+                                 Vector knockback = away.normalize().multiply(knockbackPower).setY(0.5);
+                                 knockTarget.setVelocity(knockback);
+                              }
+                           }
+                        }).runTaskLater(SpeedAbilities.this.plugin, 1L);
+                        target.getWorld().spawnParticle(Particle.DUST, target.getLocation().add(0.0, 1.0, 0.0), 40, 0.5, 0.5, 0.5, 0.0, strikeDust, true);
+                        target.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, target.getLocation().add(0.0, 1.0, 0.0), 25, 0.5, 0.5, 0.5);
+                     }
+                  }
+               }
+            })
+            .runTaskLater(this.plugin, 5L);
+         (new BukkitRunnable() {
+            public void run() {
+               strikeLoc.getWorld().spawnParticle(Particle.DUST, strikeLoc.clone().add(0.0, 1.0, 0.0), 60, 0.4, 0.9, 0.4, 0.0, strikeDust, true);
+               strikeLoc.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, strikeLoc.clone().add(0.0, 1.0, 0.0), 40, 0.4, 0.9, 0.4, 0.05);
+            }
+         }).runTaskLater(this.plugin, 20L);
+         if (--remaining <= 0) {
+            this.blurCharges.remove(uuid);
+            BukkitTask expiry = this.blurExpiryTasks.remove(uuid);
+            if (expiry != null) {
+               expiry.cancel();
+            }
+
+            this.plugin.getAbilityManager().endAbilityDuration(player, "speed-blur");
+         } else {
+            this.blurCharges.put(uuid, remaining);
+         }
+      }
+   }
+
+   public void speedStorm(final Player player) {
+      if (this.plugin.getGemManager().getGemTier(player) < 2) {
+         player.sendMessage("§c§oThis ability requires Tier 2!");
+      } else {
+         String abilityKey = "speed-storm";
+         if (this.isSpeedStormActive(player)) {
+            this.endSpeedStorm(player);
+         } else if (this.plugin.getAbilityManager().canUseAbility(player, abilityKey)) {
+            UUID uuid = player.getUniqueId();
+            int durationSeconds = this.plugin.getConfig().getInt("abilities.durations.speed-storm", 12);
+            final int duration = durationSeconds * 20;
+            final double radius = this.plugin.getConfig().getDouble("abilities.speed-storm.radius", 6.0);
+            this.speedStormActivePlayers.add(uuid);
+            DustOptions yellowDust = new DustOptions(ParticleUtils.SPEED_YELLOW, 2.0F);
+            player.playSound(player.getLocation(), Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 1.5F, 1.5F);
+            player.playSound(player.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 1.0F, 1.8F);
+            player.spawnParticle(Particle.DUST, player.getLocation().add(0.0, 1.0, 0.0), 300, 2.0, 2.0, 2.0, 0.0, yellowDust, true);
+            player.spawnParticle(Particle.ELECTRIC_SPARK, player.getLocation().add(0.0, 1.0, 0.0), 200, 2.0, 2.0, 2.0);
+            player.spawnParticle(Particle.GUST, player.getLocation().add(0.0, 1.0, 0.0), 100, 1.5, 1.5, 1.5);
+            player.spawnParticle(Particle.EXPLOSION, player.getLocation().add(0.0, 1.0, 0.0), 10, 1.0, 1.0, 1.0);
+            BukkitTask stormTask = (new BukkitRunnable() {
+               int ticksElapsed = 0;
+
+               public void run() {
+                  if (player.isOnline() && !player.isDead() && this.ticksElapsed < duration) {
+                     this.ticksElapsed++;
+                     Location center = player.getLocation();
+                     if (this.ticksElapsed % 20 == 0) {
+                        for (Entity entity : center.getWorld().getNearbyEntities(center, radius, radius, radius)) {
+                           if (entity instanceof Player target) {
+                              boolean isTrusted = SpeedAbilities.this.plugin.getTrustedPlayersManager().isTrusted(player, target);
+                              if (!isTrusted && !target.equals(player)) {
+                                 int slowLevel = SpeedAbilities.this.plugin.getConfig().getInt("abilities.speed-storm.enemy-slowness-level", 3);
+                                 target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 40, slowLevel, false, true));
+                                 SpeedAbilities.freezePlayer(target.getUniqueId());
+                                 SpeedAbilities.this.speedStormVictims.computeIfAbsent(player.getUniqueId(), k -> new HashSet<>()).add(target.getUniqueId());
+                                 double stormDamage = SpeedAbilities.this.plugin.getConfig().getDouble("abilities.speed-storm.damage", 3.0);
+                                 if (stormDamage > 0.0) {
+                                    target.damage(stormDamage, player);
+                                 }
+
+                                 target.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, 40, 1, false, true));
+                              } else {
+                                 int allyBuffTicks = SpeedAbilities.this.plugin.getConfig().getInt("abilities.speed-storm.ally-buff-duration", 45) * 20;
+                                 target.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, allyBuffTicks, 2, false, true));
+                                 target.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, allyBuffTicks, 1, false, true));
+                                 SpeedAbilities.unfreezePlayer(target.getUniqueId());
+                              }
+                           }
+                        }
+                     }
+
+                     if (this.ticksElapsed % 5 == 0) {
+                        DustOptions fieldDust = new DustOptions(ParticleUtils.SPEED_YELLOW, 1.8F);
+
+                        for (int i = 0; i < 40; i++) {
+                           double angle = i / 40.0 * 2.0 * Math.PI;
+                           double x = Math.cos(angle) * radius;
+                           double z = Math.sin(angle) * radius;
+                           center.getWorld().spawnParticle(Particle.DUST, center.clone().add(x, 0.3, z), 5, 0.2, 0.1, 0.2, 0.0, fieldDust, true);
+                           center.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, center.clone().add(x, 0.5, z), 2, 0.1, 0.1, 0.1, 0.02);
+                        }
+
+                        for (int dir = 0; dir < 8; dir++) {
+                           double angle = dir * Math.PI / 4.0;
+                           double x = Math.cos(angle) * radius;
+                           double z = Math.sin(angle) * radius;
+
+                           for (double y = 0.0; y < 4.0; y += 0.5) {
+                              center.getWorld().spawnParticle(Particle.DUST, center.clone().add(x, y, z), 3, 0.1, 0.1, 0.1, 0.0, fieldDust, true);
+                           }
+                        }
+
+                        for (double y = 0.0; y < 3.0; y += 0.3) {
+                           center.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, center.clone().add(0.0, y, 0.0), 4, 0.2, 0.1, 0.2, 0.01);
+                        }
+                     }
+
+                     if (this.ticksElapsed % 40 == 0) {
+                        center.getWorld().playSound(center, Sound.BLOCK_BEACON_AMBIENT, 0.6F, 1.8F);
+                     }
+                  } else {
+                     SpeedAbilities.this.endSpeedStorm(player);
+                     this.cancel();
+                  }
+               }
+            }).runTaskTimer(this.plugin, 0L, 1L);
+            this.speedStormTasks.put(uuid, stormTask);
+            this.plugin.getAbilityManager().useAbilityWithDuration(player, abilityKey, durationSeconds);
+            String msg = this.plugin.getConfigManager().getFormattedMessage("ability-activated", "ability", "Speed Storm");
+            if (msg != null && !msg.isEmpty()) {
+               player.sendMessage(msg);
+            }
+
+            player.sendMessage("§e§oSpeed Storm active for " + durationSeconds + "s! Allies gain Speed + Haste, enemies freeze!");
+         }
+      }
+   }
+
+   private void endSpeedStorm(Player player) {
+      UUID uuid = player.getUniqueId();
+      if (this.speedStormActivePlayers.remove(uuid)) {
+         BukkitTask task = this.speedStormTasks.remove(uuid);
+         if (task != null) {
+            task.cancel();
+         }
+
+         this.plugin.getAbilityManager().endAbilityDuration(player, "speed-storm");
+         double radius = this.plugin.getConfig().getDouble("abilities.speed-storm.radius", 6.0);
+         Set<UUID> victims = this.speedStormVictims.remove(uuid);
+         if (victims != null) {
+            for (UUID targetId : victims) {
+               Player target = this.plugin.getServer().getPlayer(targetId);
+               boolean stillInOtherField = false;
+
+               for (UUID stormOwner : this.speedStormActivePlayers) {
+                  Player owner = this.plugin.getServer().getPlayer(stormOwner);
+                  if (target != null
+                     && owner != null
+                     && owner.isOnline()
+                     && owner.getWorld() == target.getWorld()
+                     && target.getLocation().distance(owner.getLocation()) <= radius) {
+                     stillInOtherField = true;
+                     break;
+                  }
+               }
+
+               if (!stillInOtherField) {
+                  unfreezePlayer(targetId);
+                  if (target != null) {
+                     target.sendMessage("§e§oYou are no longer frozen.");
+                  }
+               }
+            }
+         }
+
+         if (player.isOnline()) {
+            player.sendMessage("§e§oSpeed Storm faded.");
+            player.playSound(player.getLocation(), Sound.BLOCK_BEACON_DEACTIVATE, 0.6F, 1.5F);
+         }
+      }
+   }
+
+   public void terminalVelocity(Player player) {
+      String abilityKey = "speed-terminal";
+      if (this.plugin.getAbilityManager().canUseAbility(player, abilityKey)) {
+         int duration = this.plugin.getConfig().getInt("abilities.durations.terminal-velocity", 15) * 20;
+         player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, duration, 2, false, true));
+         player.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, duration, 4, false, true));
+         DustOptions yellowDust = new DustOptions(ParticleUtils.SPEED_YELLOW, 2.0F);
+         player.playSound(player.getLocation(), Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 1.5F, 2.0F);
+         player.playSound(player.getLocation(), Sound.ENTITY_BREEZE_SHOOT, 1.5F, 2.0F);
+         player.playSound(player.getLocation(), Sound.BLOCK_BEACON_ACTIVATE, 1.0F, 2.0F);
+         player.spawnParticle(Particle.DUST, player.getLocation().add(0.0, 1.0, 0.0), 300, 1.5, 2.0, 1.5, 0.0, yellowDust, true);
+         player.spawnParticle(Particle.ELECTRIC_SPARK, player.getLocation().add(0.0, 1.0, 0.0), 200, 1.5, 2.0, 1.5);
+         player.spawnParticle(Particle.GUST, player.getLocation().add(0.0, 1.0, 0.0), 100, 1.0, 1.5, 1.0);
+         player.spawnParticle(Particle.EXPLOSION, player.getLocation().add(0.0, 1.0, 0.0), 8, 1.0, 1.0, 1.0);
+         player.spawnParticle(Particle.HAPPY_VILLAGER, player.getLocation().add(0.0, 1.0, 0.0), 60, 1.0, 1.0, 1.0);
+
+         for (int i = 0; i < 32; i++) {
+            double angle = i / 32.0 * 2.0 * Math.PI;
+            double x = Math.cos(angle) * 2.5;
+            double z = Math.sin(angle) * 2.5;
+            player.getWorld().spawnParticle(Particle.DUST, player.getLocation().add(x, 0.5, z), 8, 0.2, 0.1, 0.2, 0.0, yellowDust, true);
+            player.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, player.getLocation().add(x, 1.0, z), 4, 0.1, 0.1, 0.1);
+         }
+
+         this.plugin.getAbilityManager().useAbilityWithDuration(player, abilityKey, duration / 20);
+         String msg = this.plugin.getConfigManager().getFormattedMessage("ability-activated", "ability", "Terminal Velocity");
+         if (msg != null && !msg.isEmpty()) {
+            player.sendMessage(msg);
+         }
+
+         player.sendMessage("§e§l⚡ TERMINAL VELOCITY §7- Speed III + Haste V for " + duration / 20 + " seconds!");
+      }
+   }
+
+   public void cleanup(UUID playerId) {
+      if (this.speedStormTasks.containsKey(playerId)) {
+         this.speedStormTasks.get(playerId).cancel();
+         this.speedStormTasks.remove(playerId);
+      }
+
+      Player p;
+      if (this.speedStormActivePlayers.remove(playerId) && (p = this.plugin.getServer().getPlayer(playerId)) != null) {
+         this.plugin.getAbilityManager().endAbilityDuration(p, "speed-storm");
+      }
+
+      Set<UUID> victims = this.speedStormVictims.remove(playerId);
+      if (victims != null) {
+         victims.forEach(SpeedAbilities::unfreezePlayer);
+      }
+
+      this.blurCharges.remove(playerId);
+      BukkitTask blurExpiry = this.blurExpiryTasks.remove(playerId);
+      if (blurExpiry != null) {
+         blurExpiry.cancel();
+      }
+
+      unfreezePlayer(playerId);
+   }
+
+   public static void cleanupAllFrozen() {
+      frozenPlayers.clear();
+   }
+}
